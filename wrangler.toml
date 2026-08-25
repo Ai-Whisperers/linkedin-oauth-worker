@@ -1,0 +1,14 @@
+name = "linkedin-oauth"
+main = "src/index.js"
+compatibility_date = "2024-09-01"
+
+[vars]
+# LINKEDIN_REDIRECT_URI is per-environment — keep in secrets, not vars.
+# LINKEDIN_CLIENT_ID, LINKEDIN_CLIENT_SECRET, BWS_TOKEN, BWS_*, CF_KV_* — all secrets.
+
+[[kv_namespaces]]
+binding = "OAUTH_STATE"
+id = "REPLACE_WITH_KV_NS_ID"
+
+[observability]
+enabled = true
