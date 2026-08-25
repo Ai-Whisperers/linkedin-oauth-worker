@@ -1,47 +1,28 @@
 /**
- * linkedin-oauth — Cloudflare Worker implementing the OAuth 2.0 authorization
- * code flow for the Hermes LinkedIn integration.
+ * linkedin-oauth — CF Worker. Hermes Hermes MCP integration.
+ *
+ * OAuth 2.0 authorization code flow for LinkedIn.
+ *
+ * Writes the access token to CF KV namespace `OAUTH_STATE` (key prefix `linkedin:`).
+ * A separate cron in the hermes container (kv_bws_sync.py) bridges CF KV → BWS via the SDK.
+ *
+ * Why CF KV instead of BWS directly: BWS machine-account tokens only support SDK-based writes
+ * (not REST PUT). CF Workers can't load the SDK. So we write to CF KV (Worker-native) and sync.
  *
  * Endpoints:
- *   GET  /auth/linkedin/start      → 302 to LinkedIn authorize URL (with state cookie)
- *   GET  /auth/linkedin/callback   → exchanges code, writes token to BWS, returns success HTML
- *   POST /auth/linkedin/refresh    → exchanges refresh_token for a new access_token
- *   GET  /healthz                  → 200 "ok"
+ *   GET  /auth/linkedin/start      → 302 to LinkedIn authorize URL
+ *   GET  /auth/linkedin/callback   → exchanges code → stores to CF KV → green success page
+ *   POST /auth/linkedin/refresh    → exchanges refresh_token → updates KV
+ *   GET  /healthz                  → liveness probe
  *
- * Secrets required (set with `wrangler secret put`):
+ * Secrets (set via `wrangler secret put`):
  *   LINKEDIN_CLIENT_ID
  *   LINKEDIN_CLIENT_SECRET
- *   LINKEDIN_REDIRECT_URI              e.g. https://hermes.paragu-ai.com/auth/linkedin/callback
- *   LINKEDIN_SCOPES                    space-separated, default "openid profile email w_member_social"
- *   BWS_ACCESS_TOKEN                   Bitwarden Secrets Manager service-account token
- *   BWS_BASE_URL                       default https://vault.bitwarden.com/api
- *   BWS_SECRET_ID_ACCESS_TOKEN         UUID of the LINKEDIN_ACCESS_TOKEN secret
- *   BWS_SECRET_ID_ISSUED_AT            UUID of the LINKEDIN_TOKEN_ISSUED_AT secret
- *   BWS_SECRET_ID_SCOPES               UUID of the LINKEDIN_TOKEN_SCOPES secret
- *   BWS_SECRET_ID_REFRESH_TOKEN        UUID of the LINKEDIN_REFRESH_TOKEN secret (optional)
- *
- * Trademark note: this Worker is named `linkedin-oauth` per the org banlist
- * carve-outs. Do not rename to anything containing upstream product names.
+ *   LINKEDIN_REDIRECT_URI
+ *   LINKEDIN_SCOPES       (space-separated)
  */
 
-// ----- BWS client (minimal REST wrapper) -----
-async function bwsPutSecret(baseUrl, bwsToken, secretId, value) {
-  const r = await fetch(`${baseUrl}/secrets/${secretId}`, {
-    method: "PUT",
-    headers: {
-      "Authorization": `Bearer ${bwsToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ value }),
-  });
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`BWS PUT failed ${r.status}: ${t.slice(0, 200)}`);
-  }
-  return await r.json();
-}
-
-// ----- State store (10-min TTL via KV) -----
+// ----- CSRF state (CF KV) -----
 async function saveState(kv, state) {
   await kv.put("state:" + state, "1", { expirationTtl: 600 });
 }
@@ -53,6 +34,13 @@ async function consumeState(kv, state) {
   return true;
 }
 
+// ----- Writeback helper (CF KV) -----
+async function kvPut(kv, key, value, ttlSeconds) {
+  const opts = ttlSeconds ? { expirationTtl: ttlSeconds } : undefined;
+  await kv.put(key, value, opts);
+}
+
+// ----- HTTP helpers -----
 function htmlResponse(status, body) {
   return new Response(body, {
     status,
@@ -62,14 +50,13 @@ function htmlResponse(status, body) {
 function redirect(location) {
   return new Response(null, { status: 302, headers: { Location: location } });
 }
-
 function randomState() {
   const bytes = new Uint8Array(24);
   crypto.getRandomValues(bytes);
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// ----- LinkedIn OAuth helpers -----
+// ----- LinkedIn API -----
 async function exchangeCodeForToken(env, code) {
   const body = new URLSearchParams({
     grant_type: "authorization_code",
@@ -90,7 +77,7 @@ async function exchangeCodeForToken(env, code) {
   return await r.json();
 }
 
-async function refreshToken(env, refreshToken) {
+async function refreshLongLivedToken(env, refreshToken) {
   const body = new URLSearchParams({
     grant_type: "refresh_token",
     refresh_token: refreshToken,
@@ -104,7 +91,7 @@ async function refreshToken(env, refreshToken) {
   });
   if (!r.ok) {
     const t = await r.text();
-    throw new Error(`LinkedIn token refresh failed ${r.status}: ${t.slice(0, 300)}`);
+    throw new Error(`LinkedIn refresh failed ${r.status}: ${t.slice(0, 300)}`);
   }
   return await r.json();
 }
@@ -144,6 +131,9 @@ async function handleCallback(env, request) {
   let token;
   try {
     token = await exchangeCodeForToken(env, code);
+    if (!token.access_token) {
+      throw new Error("Token missing access_token field: " + JSON.stringify(token));
+    }
   } catch (e) {
     return htmlResponse(502, `<h1>Token exchange failed</h1><pre>${String(e).slice(0, 500)}</pre>`);
   }
@@ -151,22 +141,17 @@ async function handleCallback(env, request) {
   const issuedAt = new Date().toISOString();
   const expiresInDays = token.expires_in ? Math.round(token.expires_in / 86400) : 60;
 
-  // Write all 3 (or 4) secrets to BWS
-  const baseUrl = env.BWS_BASE_URL || "https://vault.bitwarden.com/api";
-  const writes = [
-    bwsPutSecret(baseUrl, env.BWS_ACCESS_TOKEN, env.BWS_SECRET_ID_ACCESS_TOKEN, token.access_token),
-    bwsPutSecret(baseUrl, env.BWS_ACCESS_TOKEN, env.BWS_SECRET_ID_ISSUED_AT, issuedAt),
-    bwsPutSecret(baseUrl, env.BWS_ACCESS_TOKEN, env.BWS_SECRET_ID_SCOPES, token.scope || ""),
-  ];
-  if (token.refresh_token && env.BWS_SECRET_ID_REFRESH_TOKEN) {
-    writes.push(bwsPutSecret(baseUrl, env.BWS_ACCESS_TOKEN, env.BWS_SECRET_ID_REFRESH_TOKEN, token.refresh_token));
-  }
-
-  let writeErrors = [];
-  await Promise.all(writes.map((p) => p.catch((e) => writeErrors.push(String(e).slice(0, 200)))));
-
-  if (writeErrors.length === writes.length) {
-    return htmlResponse(502, `<h1>LinkedIn authorized but BWS writes failed</h1><pre>${writeErrors.join("\n")}</pre>`);
+  // Write all token fields to CF KV (key prefix "linkedin:") for the kv-bws-sync cron to pick up.
+  // KV entries use 90-day TTL — covers the 60-day token lifetime with buffer.
+  try {
+    await kvPut(env.OAUTH_STATE, "linkedin:access_token", token.access_token, 90 * 86400);
+    await kvPut(env.OAUTH_STATE, "linkedin:issued_at", issuedAt, 90 * 86400);
+    await kvPut(env.OAUTH_STATE, "linkedin:scopes", env.LINKEDIN_SCOPES || "", 90 * 86400);
+    if (token.refresh_token) {
+      await kvPut(env.OAUTH_STATE, "linkedin:refresh_token", token.refresh_token, 90 * 86400);
+    }
+  } catch (e) {
+    return htmlResponse(502, `<h1>CF KV writeback failed</h1><pre>${String(e).slice(0, 500)}</pre>`);
   }
 
   return htmlResponse(
@@ -174,8 +159,8 @@ async function handleCallback(env, request) {
     `<!doctype html><html><head><title>LinkedIn connected</title></head><body>
      <h1>LinkedIn connected ✓</h1>
      <p>Token expires in <b>${expiresInDays} days</b>. Issued at ${issuedAt}.</p>
-     <p>Scopes: <code>${token.scope || "(unknown)"}</code></p>
-     ${writeErrors.length ? `<p style="color:#c80">⚠️ ${writeErrors.length} of ${writes.length} secret writes failed — check logs.</p>` : ""}
+     <p>Scopes: <code>${env.LINKEDIN_SCOPES || "(unknown)"}</code></p>
+     <p>Token written to CF KV (kv-bws-sync will move it to BWS within 5 min).</p>
      <p>You can close this tab.</p>
      </body></html>`
   );
@@ -183,28 +168,32 @@ async function handleCallback(env, request) {
 
 async function handleRefresh(env, request) {
   if (request.method !== "POST") return new Response("POST only", { status: 405 });
-  let refreshTokenValue;
+  let refreshToken;
   try {
     const body = await request.json();
-    refreshTokenValue = body.refresh_token;
+    refreshToken = body.refresh_token;
   } catch {
     return new Response("invalid JSON body", { status: 400 });
   }
-  if (!refreshTokenValue) return new Response("missing refresh_token", { status: 400 });
+  if (!refreshToken) return new Response("missing refresh_token", { status: 400 });
 
   let token;
   try {
-    token = await refreshToken(env, refreshTokenValue);
+    token = await refreshLongLivedToken(env, refreshToken);
   } catch (e) {
     return new Response(String(e).slice(0, 500), { status: 502 });
   }
 
   const issuedAt = new Date().toISOString();
-  const baseUrl = env.BWS_BASE_URL || "https://vault.bitwarden.com/api";
-  await Promise.all([
-    bwsPutSecret(baseUrl, env.BWS_ACCESS_TOKEN, env.BWS_SECRET_ID_ACCESS_TOKEN, token.access_token),
-    bwsPutSecret(baseUrl, env.BWS_ACCESS_TOKEN, env.BWS_SECRET_ID_ISSUED_AT, issuedAt),
-  ]);
+  try {
+    await kvPut(env.OAUTH_STATE, "linkedin:access_token", token.access_token, 90 * 86400);
+    await kvPut(env.OAUTH_STATE, "linkedin:issued_at", issuedAt, 90 * 86400);
+    if (token.refresh_token) {
+      await kvPut(env.OAUTH_STATE, "linkedin:refresh_token", token.refresh_token, 90 * 86400);
+    }
+  } catch (e) {
+    return new Response("CF KV writeback failed: " + String(e).slice(0, 300), { status: 502 });
+  }
 
   return Response.json({ ok: true, expires_in: token.expires_in, issued_at: issuedAt });
 }
